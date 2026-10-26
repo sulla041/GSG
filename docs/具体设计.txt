@@ -1,0 +1,228 @@
+# 当前 V1 组件规格（与实现同步）
+
+> 本文件描述当前主线 V1，不包含尚未实现的候选算子；V0 保留为无自适应噪声基线。目标是验证神经网络在给定
+> 数据分布和固定点集维度下，能否近似保留图信息并生成与目标图相近的 `G'`，不宣称完全
+> 还原或无损编码。
+
+## 0. 输入与约定
+
+- `X`：节点特征，形状 `[B, V, d_x]`。
+- `R`：全关系张量，形状 `[B, V, V, d_r]`；`R[:, j, i]` 表示有向关系 `j -> i`。
+- 所有节点对都有关系向量；无边是显式 `r_null`，不是 mask。`node_mask` 只处理 batch padding，`pair_mask[:, j, i] = node_mask[:, j] * node_mask[:, i]`。
+- 合成实验使用连续节点和连续关系向量，节点/关系类型数均不适用且不可数。
+- 真实分子实验将离散类别转换为 one-hot 连续输入：ZINC 为 21 类节点、3 类真实边、4 类
+  稠密关系；QM9 为 5 类节点、3 类真实边、4 类稠密关系。第 0 类关系是显式 `r_null`，
+  不属于 `node_mask` 或 `pair_mask`。
+
+## 1. ENCS：节点预编码
+
+```text
+s(0, i) = ENCS(x(i)) = MLP_X(x(i))
+```
+
+输入 `X:[B,V,d_x]`，输出 `S(0):[B,V,d]`。当前实现为独立 MLP，不加入噪声或手工位置编码。
+实现：`code/v0/encs.py`。
+
+## 2. ENCR：关系预编码
+
+```text
+re(j, i) = ENCR(r(j,i)) = MLP_R(r(j,i))
+```
+
+输入 `R:[B,V,V,d_r]`，输出 `[B,V,V,d_p]`，供所有演化层使用。实现：`code/v0/encr.py`。
+
+## 3. SETATTN：集合上下文
+
+```text
+Q = S W_Q, K = S W_K, V = S W_V
+H = LayerNorm(S + softmax(QK^T / sqrt(d_h)) V W_O)
+C = H + MLP_set(H)
+```
+
+padding 节点不参与 key/value 注意力，输出 padding 节点置零。当前为单头实现，作为
+`PAIRATTN` 和终态解码的全局上下文。实现：`code/v0/setattn.py`。
+
+## 4. PAIRATTN：有向点对探针
+
+```text
+C = SETATTN(S)
+q_j = Linear_src(C_j), k_i = Linear_dst(C_i)
+p_ji = MLP_pair(concat(q_j * k_i, q_j - k_i))
+```
+
+`p:[B,V,V,d_p]`，第 2 维为源节点 `j`，第 3 维为目标节点 `i`。源/目标投影不共享，
+因此支持有向关系。演化探针只读取当前 `S`，不读取真实 `R`。实现：`code/v0/pairattn.py`。
+
+## 5. ENCO、Gate 与逐层演化
+
+```text
+u_ji = ENCO(concat(p_ji, re_ji))
+a_ji = pair_mask_ji * sigmoid(MLP_gate(concat(p_ji, re_ji)))
+o_i = sum_j(a_ji * u_ji)
+s(l+1,i) = LayerNorm(s(l,i) + o_i)
+```
+
+`a` 是标量软门控，`u` 与点集宽度相同；当前不除以 `V`，不宣称严格稀疏。每个
+`EvolutionLayer` 独立拥有自己的 `PAIRATTN`、`ENCO`、`Gate` 和 `LayerNorm` 参数，默认
+包含自关系，演化轮数 `L` 由 `layers` 控制。实现：`code/v0/enco.py`、`gate.py`、
+`evolution.py`。
+
+## 6. 终态解码与训练目标
+
+```text
+X' = NodeHead(SETATTN_out(S(L)))
+R' = PAIRATTN_out(S(L))
+L = L_node_mse + L_relation_mse
+    + lambda_similarity * (1 - cosine(R', R_target))
+```
+
+终态 `SETATTN_out` 和 `PAIRATTN_out` 为解码器独立参数，均只读取 `S(L)`，不读取输入
+`X` 或 `R`。当前连续 one-hot 实验使用 masked MSE 主项和可导关系余弦辅助项；准确率、
+macro-F1 只用于评估，不参与梯度。当前 `lambda_similarity=0.1` 只是实验参数。
+实现：`code/v0/decoder.py`、`loss.py`、`training.py`。
+
+## 7. 训练闭环与输出
+
+```text
+batch = {nodes, relations, node_mask}
+S(L), X', R' = V0Model(nodes, relations, node_mask)
+loss.backward() -> AdamW.step()
+```
+
+`masked_mse` 只统计有效节点或有效节点对及其特征维度；`r_null` 不被 mask。训练脚本每
+5 秒最多输出一行 batch 进度，并在 epoch 结束输出分项指标。合成入口为
+`script/train_v0_reconstruction.py`，真实分子入口为 `script/train_v0_real.py`，真实图
+转换为 `dataset/v0_real_molecule.py`。
+
+## 8. 当前验证与效果
+
+目标是验证 `S_e` 能否近似保留图信息并生成相近的 `G'`，不宣称完全还原。
+
+### 8.1 当前真实 ZINC 效果
+
+单种子、30 epoch、10,000/1,000 张 train/val 图、`lambda_similarity=0.1` 的 `layers=4`
+实验达到验证节点 MSE `5.0271e-05`、关系 MSE `1.3426e-03`。使用 checkpoint
+`runs/v0_real/zinc_layers4_similarity_best.pt` 在官方 test split 上评估得到：节点 accuracy
+`0.999955`，全部关系 accuracy `0.995860`，真实边 accuracy `0.983878`，`r_null`
+accuracy `0.997046`，关系 macro-F1 `0.985704`，边存在性 macro-F1 `0.987411`，MSE
+`0.001309`。相较 `layers=2` 的真实边 accuracy `0.819735`，四轮演化显示出明显更强的
+近似关系保持能力；这些结果仍不代表完全还原或跨数据集泛化。
+
+### 8.2 当前阶段边界
+
+- 当前只做单种子算法机制验证，暂不做多种子统计实验。
+- `layers=4` 独立轮数实验已完成；不同轮数仍必须使用各自 checkpoint 评估。
+- 尚未完成 QM9 正式训练、图级任务、基线比较或 `project/` 晋级。
+- 评估入口：`script/evaluate_v0_real.py`；离散指标实现：`code/v0/evaluation.py`。
+
+## 9. 初始噪声与对称性区分
+
+### 9.1 核心问题
+
+V0 与 V1 的 `ENCS` 都是确定性节点 MLP；V1 在逐层演化后加入自适应噪声。对于节点特征完全相同、且关系多重集在节点间
+完全对称的图，`SETATTN`、`PAIRATTN` 和关系条件聚合都是置换等变的：对称节点会得到
+相同的上下文、点对状态和聚合偏差。若终态点集中的节点仍完全相同，`PAIRATTN_out` 也
+无法仅凭点对位置区分同一图内部的对称节点对。
+
+例如，4 节点环和 4 节点全连接图都可以令节点特征相同。每个图内部的节点分别具有相同
+的关系多重集；确定性消息聚合会保持节点间简并。关系类型数量不同可以区分两个图的整体
+分布，但不能自动为对称图内部的节点建立唯一坐标，因此可能限制逐点关系矩阵的重构。
+
+### 9.2 V1 噪声机制
+
+可在初始点集加入微小随机节点标识：
+
+```text
+s(0, i) = MLP_X(x(i)) + epsilon_i
+epsilon_i ~ N(0, sigma^2 I)
+```
+
+噪声使 `q_j`、`k_i` 和 `p_ji` 能够把局部关系与节点实例绑定，为对称结构提供隐式坐标，
+从而可能降低关系重构中的对称性坍缩。它打破的是单次前向中的节点简并，不代表破坏图的
+置换等变性或提供真实拓扑位置编码。
+
+逐样本排列测试时，噪声必须随节点使用同一排列；如果每次前向独立重采样，只能讨论分布
+意义上的等变性。噪声幅度 `sigma`、是否固定噪声和是否使用正交随机特征都属于新增实验
+参数，已作为当前 V1 主线机制；V0 不包含该机制。
+
+### 9.3 当前边界与实验顺序
+
+- V1 不在 ENCS 初始输出直接加噪声，而是在每层关系演化后通过自适应噪声滤波器注入噪声；
+  ZINC 结果只说明当前数据分布下近似关系恢复有效，不能推断所有强对称图都能恢复。
+- 初始噪声应先在 `test/` 中使用 4 节点环、全连接图和其他可控对称图验证，再决定是否进入
+  `code/v0/`。
+- 实验需同时报告无噪声、固定同步噪声和独立重采样噪声的重构误差、关系类别指标、排列
+  等变误差和跨随机种子方差。
+- V1 已通过当前 smoke 和正式 ZINC 评估；V0 正式配置继续保留用于基线对照，两个版本均未进入 `project/`。
+
+## 10. V1：逐层自适应噪声主线
+
+V1 与 V0 分目录实现。V0 的关系演化结构保持不变，V1 在每个 `EvolutionLayer` 的状态
+更新后增加独立的自适应噪声滤波器：
+
+```text
+c(l,i) = mean_j exp(-||s(l,i) - s(l,j)||^2 / temperature)
+         , j != i, 且 j 为有效节点
+sigma(l,i) = max_noise * c(l,i)
+s_noisy(l+1,i) = s(l+1,i) + sigma(l,i) * epsilon(l,i)
+```
+
+当前 V1 使用有效节点间的高斯相似度均值作为聚拢程度；节点越聚拢，`sigma` 越大，节点越
+分离，`sigma` 越小。`temperature`、`max_noise` 和噪声采样方式都是 V1 实验参数，不改变
+V0 的已确认定义。
+
+- V1 测试位置：`test/v1/`；正式位置：`code/v1/`。
+- V1 每层独立创建演化模块和噪声滤波器，不共享 V0 参数；当前只复用 V0 算子类结构。
+- 噪声必须在排列测试中随节点同步排列；padding 节点噪声为零。
+- V1 已通过 CUDA、反向传播、聚拢/分离响应和同步噪声排列 smoke。
+- 当前 V1 已完成一次单种子 ZINC 正式训练和 test 评估，现作为主线版本；V0 降级为稳定基线。
+- V1 训练入口为 `script/train_v1_real.py`，评估入口为 `script/evaluate_v1_real.py`；评估使用
+  固定 `noise-seed` 生成逐层噪声，保证同一 checkpoint 的结果可复现。
+- V1 已完成一次单种子 ZINC `layers=4` 正式运行：节点 accuracy `0.999957`，全部关系
+  accuracy `0.999067`，真实边 accuracy `0.994610`，`r_null` accuracy `0.999506`，关系
+  macro-F1 `0.748045`，边存在性 macro-F1 `0.997654`，MSE `0.000488`。macro-F1 使用全
+  test split 混淆矩阵计算；少数真实关系类别仍存在明显混淆。
+
+## 11. 版本记录规则
+
+- 当前主线版本为 V1，V0 是无自适应逐层噪声基线。
+- 每个新的可接受实验结果建立新的版本记录，例如 `V1.1`、`V1.2`；记录结构、数据、训练配置、checkpoint 和评估指标。
+- 新版本不得覆盖旧版本目录或 checkpoint；未通过验证的结果只保留为实验记录，不提升主线版本。
+
+## 12. 下游任务统一视角
+
+V1 将节点级、关系级和图级任务统一放在以下数据流中：
+
+```text
+G(X,R) -> S_e -> G'(X',R') -> y_graph
+```
+
+目标图预测首先从 `S_e` 解码出节点特征 `X'` 和有序关系特征 `R'`；节点级任务评估 `X'`，
+关系级任务评估 `R'`；图级任务通过
+对节点状态、关系状态或其统计量进行置换不变聚合得到输出。图级任务不必逐项精确重构全部
+关系，但任务所需的局部结构和全局统计信息必须先被编码进 `S_e`，再由聚合头形成图级表示。
+
+因此，节点/关系预测本身就是目标图 `G'` 的组成部分，不是脱离图恢复的独立任务。节点/关系
+近似恢复是 V1 验证目标图预测能力的基础实验，图级预测是 `G'` 或 `S_e` 之上的聚合读出，
+而不是用一个未经解释的图级标量替代节点和关系信息。具体聚合器可以是 GCN 式消息聚合、
+集合池化或其他置换不变读出，但必须明确其输入信息来自 `S_e`。
+
+## 13. V1-C 自包含候选
+
+V1-C 是当前 V1 的行为保持、自包含实现，不改变 V1 的算法公式、层间结构、噪声位置或训练
+目标。实现目录为 `code/v1_c/`，模型入口为 `v1_c.V1CModel`。其内部包含 ENCS、ENCR、
+SETATTN、PAIRATTN、ENCO、Gate、EvolutionLayer、Decoder、AdaptiveNoiseFilter、loss、
+training 和 downstream；所有模块使用包内相对导入，不依赖 `code/v0/` 或 `code/v1/`。
+
+V1-C 已通过 `test/test_v1_c_isolation.py` 的 CPU smoke，验证本地导入、完整前向、padding
+行为、输出形状和反向传播。当前没有 V1-C 的 CUDA smoke、真实数据训练、test 指标或 checkpoint。
+因此 V1-C 只记录为自包含候选，当前主线仍为 V1；V1-C 进入主线前必须补充与 V1 相同配置的
+CUDA、排列等变性、训练和 test 对照。
+## 14. 电路表征建模实验任务
+电路任务输入保持完整 `G=(X,R)`，不通过隐藏边或删除关系制造图任务。节点 area、internal power 和 leakage 等节点局部标签只作控制实验；graph area/total power 的节点求和只作聚合评估。
+首要图敏感任务为：
+1. 完整图级 QoR：Yosys/ABC mapped area、cell count、logic depth、OpenSTA WNS/TNS、critical path 和 timing violation；
+2. 完整 timing graph 的 path-level arrival、required、slack、slew 和 criticality；
+3. 多个综合 candidate 的 area/timing delta、QoR ranking 和 Pareto 选择；
+4. Yosys equivalence/formal 驱动的电路功能和结构表示任务。
+标签协议分为 synthesis-level 与 physical-level。前者使用 Yosys/ABC 和 OpenSTA；后者增加 OpenROAD floorplan/placement/CTS/routing、OpenRCX SPEF 和 post-route OpenSTA。power 必须登记 activity、corner、frequency 和 Liberty 条件；没有这些字段的结果不称为完整 PPA。

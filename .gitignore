@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Experiment outputs are kept outside the source snapshot.
+runs/
+checkpoints/
+*.pt
+*.pth
