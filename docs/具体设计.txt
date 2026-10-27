@@ -226,3 +226,318 @@ CUDA、排列等变性、训练和 test 对照。
 3. 多个综合 candidate 的 area/timing delta、QoR ranking 和 Pareto 选择；
 4. Yosys equivalence/formal 驱动的电路功能和结构表示任务。
 标签协议分为 synthesis-level 与 physical-level。前者使用 Yosys/ABC 和 OpenSTA；后者增加 OpenROAD floorplan/placement/CTS/routing、OpenRCX SPEF 和 post-route OpenSTA。power 必须登记 activity、corner、frequency 和 Liberty 条件；没有这些字段的结果不称为完整 PPA。
+
+
+================================================================================
+15. V2-EX：共享坐标动力学与 Attn-Pair 关系提取（待审核详细设计）
+================================================================================
+
+状态说明：本节是 v2-ex 的隔离设计输入，不代表已经进入 `code/`、`project/` 或当前 V2 主线。
+它由当前 V2 多跳实验、RPP/Attn-Pair isolation smoke 和后续讨论整理而成。公式、步数、宽度、
+噪声策略、聚合方式和诊断阈值均属于可审核实验配置；在 test smoke 和对照实验完成前，不能
+写成正式结论。
+
+## 15.1 设计目标与边界
+
+v2-ex 的目标是学习一个由完整图关系约束的自适应坐标动力学：
+
+```text
+G(X,R) -> S^(0) -> S^(1) -> ... -> S^(T) -> G'
+```
+
+其中 `S^(t)={s_i^(t)}` 是当前迭代时刻的点集状态。它不是人工位置编码，也不要求与外部
+欧氏坐标逐点一致；有效性由最终从 `S^(T)` 读出的节点/关系任务和图重构质量判断。
+
+v2-ex 不把增加层数本身称为扩散模型。它采用共享参数的确定性迭代动力学，并允许在早期
+使用随机扰动打破完全对称节点的简并。只有显式定义前向噪声过程、时间条件目标和反向 score
+监督后，才另行讨论真正的 diffusion 版本。
+
+## 15.2 当前 V2 dense topology 数据契约
+
+首个 v2-ex 验证任务沿用 `dataset/v2_dense_multi_hop_directed/`：
+
+- 节点输入 `X` 宽度为 `d_x=4`，包含 topology-only 的
+  `node_kind/node_direction/node_cell_family/node_is_sequential` 四个字段。字段的合法取值
+  范围由数据构建 manifest 登记；模型不能把它们重新编码成不可解释的标签。
+- 关系输入 `R` 宽度为 `d_r=5`，五种可数有向关系状态为
+  `r_null/CELL_ARC_forward/CELL_ARC_reverse/NET_ARC_forward/NET_ARC_reverse`。
+- `r_null` 是显式关系向量，不是 padding mask；四种有向 arc 状态保持方向独立。
+- 输入 padding 由 `node_mask` 处理；有效节点对由
+  `pair_mask[j,i]=node_mask[j]*node_mask[i]` 处理。padding 不能替代 `r_null`。
+- 标签是全有序 pair 的 `reachable` 和可达 pair 的 `min_hop`。第一版主训练只使用最终任务
+  标签，`min_hop` 用于逐 hop 诊断，不自动进入坐标动力学损失。
+
+## 15.3 完整数据流和张量形状
+
+```text
+X              : [B,N,d_x]
+R              : [B,N,N,d_r]
+S^(t)          : [B,N,d_s]
+H^(t)          : [B,N,d_s]
+E=ENCR(R)      : [B,N,N,d_p]
+pair^(t)       : [B,N,N,d_pair]
+pos^(t)        : [B,N,N,d_s]
+offset^(t)     : [B,N,N,d_s]
+DeltaS^(t)     : [B,N,d_s]
+```
+
+```text
+X,R
+  -> ENCS(X) = S^(0)
+  -> ENCR(R) = E
+  -> for t=0,...,T-1:
+       H^(t)       = SETATTN(S^(t), node_mask)
+       pair^(t)    = AttnPair(H^(t), node_mask)
+       pos^(t)     = S_j^(t) - S_i^(t)
+       offset^(t)  = f(E, pair^(t), pos^(t), pair_mask)
+       DeltaS^(t)  = aggregate_j(offset^(t))
+       S^(t+1)     = S^(t) + eta * DeltaS^(t) + noise^(t)
+  -> final SETATTN(S^(T)) and pair readout
+  -> final node/relation task heads
+```
+
+`S^(t)` 是坐标主状态，`H^(t)` 是当前集合的全局背景。`H^(t)` 可以用于关系提取，但不能
+覆盖或归一化写回 `S^(t)`，否则会破坏累计位移的尺度和固定点语义。
+
+## 15.4 SETATTN：集合级全局背景
+
+SETATTN 只把当前所有有效元素作为一个集合建模，不把 pair 当成新的 attention token：
+
+```text
+Q = S W_Q
+K = S W_K
+V = S W_V
+A = softmax_j(Q_i K_j^T / sqrt(d_a))
+H = S + (A V) W_O
+```
+
+`A` 的 source 维度只对有效节点归一化。padding key/value 在 softmax 前屏蔽，padding query
+的输出最终置零。第一版不计算全量 attention 行重叠，也不引入三点 `O(N^3)` 中介计算；
+全局中介信息通过 `H` 和后续迭代间接传递。
+
+坐标主路径不使用 `LayerNorm(S+...)`，也不使用 `RMSNorm(S)`。LayerNorm 会去除每个节点
+向量的通道均值并重新缩放通道方差；这不意味着所有长程信息必然消失，但会破坏可能编码在
+坐标均值、模长和累计尺度中的信息，并且使 `DeltaS=0` 时仍可能改变状态。RMSNorm 去掉了
+中心化但仍会缩放 `S`，因此也不能作为坐标主路径的默认替代。
+
+SETATTN 的 `H` 是独立上下文分支。若为了 Q/K/V 或前馈计算进行 RMSNorm/其他有限值处理，
+归一化结果只能留在 `H` 分支，不能写回 `S`。第一版优先使用无归一化的
+`H=S+(AV)W_O`，将数值稳定性主要交给显式步长和初始化；上下文归一化是单独 ablation。
+
+可选的全图平移 gauge 为：
+
+```text
+c^(t) = mean_i S_i^(t)
+S_i^(t) <- S_i^(t) - c^(t)
+```
+
+该操作保持所有 `pos(j,i)=s_j-s_i` 不变，只移除整个点集的共同平移；它不缩放坐标，也不能
+解决模长发散。第一版默认关闭，只有在诊断确认共同平移漂移影响数值范围时才打开，并在
+config 中登记 `graph_centering=true`。
+
+## 15.5 Attn-Pair：由 H 直接编码有序点对关系
+
+v2-ex 中的 Attn-Pair 不再对 `pair(j,i)` 做第二次 attention。attention 已经在 SETATTN
+阶段作用于集合；pair 阶段只使用上下文化后的两个元素 `H_j,H_i` 做有向关系编码：
+
+```text
+q_j = W_Q^src H_j
+k_i = W_K^dst H_i
+v_j = W_V^src H_j
+
+pair(j,i) = PairEncoder(q_j * k_i, q_j-k_i, v_j, H_j, H_i)
+```
+
+source/target 投影不共享，`pair(j,i)` 和 `pair(i,j)` 可以不同。`v_j` 保留源点状态的
+传递通道；`q_j*k_i` 提供跨投影子空间的匹配；`q_j-k_i` 提供有向差分；`H_j,H_i` 保留
+集合上下文中的节点角色。
+
+Attn-Pair 支持多个基础交互模式，不把所有关系表达能力压缩到单一的 `q_j*k_i`：
+
+```text
+m_diff(j,i) = q_j - k_i
+m_prod(j,i) = q_j * k_i
+m_sum(j,i)  = q_j + k_i
+m_value(j,i)= v_j
+m_fwd(j,i)  = sigmoid(A_fwd q_j) * k_i
+m_bwd(j,i)  = sigmoid(A_bwd k_i) * q_j
+```
+
+低秩双线性模式作为可选模式加入：
+
+```text
+m_bilin^h(j,i) = (U_h q_j)^T (V_h k_i) / sqrt(d_h)
+```
+
+它使用多个小头表达跨通道耦合，不保存完整的 `q_j tensor_product k_i` 外积。所有模式
+都由 source/target 非共享投影产生，并在 source-first 的 `[B,J,I,*]` 轴约定下计算。
+
+第一版采用固定模式组合：
+
+```text
+z(j,i) = concat(
+    m_diff, m_prod, m_value,
+    optional(m_sum), optional(m_fwd), optional(m_bwd), optional(m_bilin)
+)
+pair(j,i) = PairEncoder(z(j,i), H_j, H_i)
+```
+
+`interaction_modes` 写入 config，用于固定消融和显存预算。建议首个默认组合为
+`diff+prod+value`；方向门控和低秩双线性分别作为后续增量模式。动态模式路由不属于第一版
+固定结构；后续若需要，令每个模式先投影到相同 `d_pair`，再使用归一化模式权重进行加权，
+并单独诊断模式权重是否塌缩到单一分支。
+
+所有上述模式仍是点对级基础运算，主复杂度保持 `O(N^2*d_pair)`；低秩双线性为
+`O(N^2*heads*d_h)`，不引入全量三点中介张量或 `O(N^3)` 计算。
+
+关系 `R` 第一版不直接进入 Attn-Pair，而是经过 ENCR 后在 `f` 中与隐式 pair 关系融合。
+这样 `pair` 表示点集当前推断的关系，`R` 表示图中给出的显式关系，二者的一致化由坐标
+动力学完成，避免 Attn-Pair 直接从输入关系走捷径。
+
+## 15.6 相对位置与三模态偏移函数
+
+```text
+pos(j,i) = s_j - s_i
+e(j,i)   = ENCR(r(j,i))
+message  = MLP_f([e(j,i) || pair(j,i) || pos(j,i)])
+route    = sigmoid(MLP_gate([e(j,i) || pair(j,i)]))
+offset(j,i) = route(j,i) * message(j,i)
+```
+
+`route` 和 `message` 是同一个 `f` 模块的内部实现。`r_null` 仍是可学习关系状态，模型可以
+学习其低贡献，但不能用硬编码 padding mask 把它删除。
+
+## 15.7 共享坐标动力学与固定点
+
+所有迭代步共享一套参数：
+
+```text
+D_theta(S^(t),R) = DeltaS^(t)
+S^(t+1) = S^(t) + eta * D_theta(S^(t),R) + noise^(t)
+```
+
+`ENCR` 可以整图计算一次并跨步复用；SETATTN、Attn-Pair、`f` 和聚合规则在每个迭代步使用
+相同参数。`T` 是求解步数，不是参数组数量。
+
+无噪声时的理想固定点满足：
+
+```text
+D_theta(S*,R) = 0
+S^(t+1) = S^(t) = S*
+```
+
+因此更新路径必须保持：
+
+```text
+S^(t+1) = S^(t) + eta_t * D_theta(S^(t),R) + epsilon^(t)
+```
+
+其中 `epsilon^(t)=0` 且 `eta_t>0` 时，`D_theta(S*,R)=0` 才是停止条件。任何在每步强制
+重设节点均值或方差的操作都不属于 v2-ex 坐标动力学。
+
+第一版使用有效节点平均聚合以减小不同 `N` 对偏移尺度的影响：
+
+```text
+DeltaS_i = sum_j pair_mask(j,i) * offset(j,i)
+           / max(1, number_of_valid_sources(i))
+```
+
+`eta` 是外部步长，初始实验使用小的固定值。步长衰减属于稳定性实验参数，不能被误认为
+模型已经找到固定点；实际偏移量和未乘步长的动力学量都必须记录。
+
+## 15.8 对称性破除噪声
+
+噪声只服务于完全相同或近似相同节点的早期对称性破除，不作为持续随机扩散过程：
+
+```text
+c_i^(t) = mean_{j != i} exp(-||s_i^(t)-s_j^(t)||^2 / temperature)
+sigma_i^(t) = noise_max * c_i^(t)
+epsilon_i^(t) = sigma_i^(t) * xi_i^(t)
+```
+
+padding 节点噪声为零。候选调度具体写为：
+
+```text
+sigma_i^(0)   = noise_max * c_i^(0)
+sigma_i^(t+1) = min(sigma_i^(t), noise_max * c_i^(t+1))
+epsilon_i^(t) = sigma_i^(t) * xi_i^(t)
+```
+
+当 `sigma_i^(t)` 低于登记的停止阈值时，该节点不再注入噪声。该单调包络是外部调度，不
+改变 `f` 参数。训练和评估保存 noise seed；排列测试时噪声必须随节点排列同步。
+
+噪声停止不等于坐标动力学收敛。诊断必须分别记录 `noise_norm` 与确定性
+`eta*DeltaS_norm`。
+
+## 15.9 最终监督与中间诊断
+
+v2-ex 只对最终状态提供训练梯度：
+
+```text
+S^T -> final node/relation heads -> L_final
+```
+
+第一版不对中间状态增加辅助 loss，不对中间坐标施加人工轨迹标签。诊断记录：
+
+```text
+update_norm_t     = ||eta * DeltaS^(t)||_F / sqrt(N*d_s)
+raw_offset_norm_t = ||DeltaS^(t)||_F / sqrt(N*d_s)
+noise_norm_t      = ||epsilon^(t)||_F / sqrt(N*d_s)
+coordinate_norm_t = ||S^(t)||_F / sqrt(N*d_s)
+relation_metric_t = metric(Decode(S^(t)), target)
+```
+
+诊断分类为：
+
+1. 正确收敛：update 后期趋小，noise 消失，raw offset 也接近零，最终关系指标稳定且有效。
+2. 错误停滞：更新量趋小，但最终关系指标长期较差。
+3. 振荡/发散：更新量反复增大或持续波动，坐标尺度增长，关系指标不稳定。
+
+`raw_offset_norm` 不要求每一步严格单调下降；它必须在后期趋于零。只把 `eta_t` 变小而
+没有降低 `raw_offset_norm`，只能说明外部步长停止了更新，不能判定动力学找到了固定点。
+
+诊断指标不参与第一版训练 loss。只有确认系统能稳定演化后，才讨论稳定性正则。
+
+## 15.10 最终读出与任务边界
+
+```text
+H^T       = SETATTN(S^T)
+pair^T    = PairEncoder(H_j^T,H_i^T)
+X'        = NodeHead(S^T,H^T)
+R'        = RelationHead(pair^T)
+```
+
+最终读出不直接读取原始 `R`；原始关系只在坐标演化中作为条件输入。V2 dense reachability
+可以用 `R'` 预测全有序 pair 的 `reachable`，用真实 `min_hop` 做分 hop 诊断。其他
+query-conditioned head 必须单独登记其输入，不能把结果解释为纯坐标恢复能力。
+
+## 15.11 复杂度、显存和执行边界
+
+```text
+SETATTN        O(N^2*d_s)
+Attn-Pair      O(N^2*d_pair)
+三模态 f       O(N^2*(d_p+d_pair+d_s))
+source 聚合    O(N^2*d_s)
+总计算         O(T*N^2)
+```
+
+不加入全量三点中介张量，因此不把复杂度提升到 `O(N^3)`。显存按 `T`、`N^2`、`d_s`、
+`d_pair` 和 attention 中间状态记录。v2-ex 首轮只在 V2 dense topology 的 `max_nodes=512`
+边界内验证，不能与 DAC V1-C 的 `max_nodes=2048` 边界混称。
+
+## 15.12 验证顺序与当前状态
+
+1. test：无 LayerNorm/RMSNorm 坐标路径、共享层、Attn-Pair 直接读取 `H`、padding、有限值、
+   CUDA、同步噪声排列等变性，以及可选 graph centering 的 pair 差分保持性。
+2. 单图：同一真实图展开 `T=2/4/8/16/32`，只监督最终 reachable，记录三类收敛诊断和多跳指标。
+3. 跨图 smoke：固定真实 train/val split，比较独立参数 V2、共享动力学 v2-ex 和噪声退出策略。
+4. 正式对照：前述 smoke 通过后才运行完整 split；原 V2 checkpoint、日志和结果不得覆盖。
+
+当前不进入 v2-ex 的内容包括：显式 score matching、前向扩散噪声训练、三点 mediator overlap、
+矩阵值节点坐标、完整外积 pair 张量和任何读取 delay/power 标签的坐标输入。
+
+本节已明确 v2-ex 的数据流、张量契约、关系类型、共享动力学、Attn-Pair、相对位置、无
+LayerNorm 更新、对称性噪声、最终监督和中间诊断。当前独立实现位于 `test/v2_ex/` 与
+`code/v2_ex/`；CPU smoke 和真实图反向已通过。当前执行环境无法枚举 A100（`nvidia-smi`
+无设备、CUDA Driver API `cuInit` 返回 999），所以 CUDA 验证仍未完成，不能据此宣称 CUDA
+已打通或 v2-ex 已达到可接受算法结果。
