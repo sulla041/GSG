@@ -4,6 +4,14 @@
 > 数据分布和固定点集维度下，能否近似保留图信息并生成与目标图相近的 `G'`，不宣称完全
 > 还原或无损编码。
 
+## 当前电路 RC 数据任务状态（2026-10-29）
+
+电路数据集将输入与目标分为 canonical cell/pin/net 图、`G_route` 和 `G_rc` 三个视图。
+`G_route` 输入 route geometry 与 RC corner，预测 resistor、ground capacitor 与 coupling
+capacitor；`G_rc` 输入已提取 RC 网络和时序条件，预测 eligible driver-to-sink net delay。
+Nangate45/GCD 的首个真实样本已产生 `1,813/2,539/4,913` 条对应关系标签并保存 ODB、DEF、SPEF，
+但 DEF/ODB 到 RC terminal 的图映射及 dense net-delay 导出仍属于下一阶段实现，不能提前作为模型结果。
+
 ## 0. 输入与约定
 
 - `X`：节点特征，形状 `[B, V, d_x]`。
@@ -541,3 +549,5 @@ LayerNorm 更新、对称性噪声、最终监督和中间诊断。当前独立�
 `code/v2_ex/`；CPU smoke 和真实图反向已通过。当前执行环境无法枚举 A100（`nvidia-smi`
 无设备、CUDA Driver API `cuInit` 返回 999），所以 CUDA 验证仍未完成，不能据此宣称 CUDA
 已打通或 v2-ex 已达到可接受算法结果。
+
+
