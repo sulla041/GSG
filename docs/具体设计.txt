@@ -12,6 +12,15 @@ capacitor；`G_rc` 输入已提取 RC 网络和时序条件，预测 eligible dr
 Nangate45/GCD 的首个真实样本已产生 `1,813/2,539/4,913` 条对应关系标签并保存 ODB、DEF、SPEF，
 但 DEF/ODB 到 RC terminal 的图映射及 dense net-delay 导出仍属于下一阶段实现，不能提前作为模型结果。
 
+## 当前 CircuitNet 输入图状态（2026-10-29）
+
+CircuitNet Final 的 `10,305` 个 mapped-netlist 实例已经构造成彼此独立的 `G_topo` 与 `G_delay_input`。这不修改 V1/V2/V3 的动力学公式，只明确电路任务向 `G(X,R)` 提供什么。
+
+- `G_topo`：8 类可数节点 `standard_cell/cell_input_pin/cell_output_pin/net/primary_input/primary_output/primary_inout/constant`，10 类可数结构关系；用于保证模型先完整看到电路连通与方向。
+- `G_delay_input`：复用相同节点，增加 `cell_timing_arc` 与 `driver_to_sink_net_arc`，因此有 12 类关系。cell 节点带具体 master、drive strength 和可数 master/pin 编码；timing arc 带 input slew、output load、fanout resistance/count 及每通道 mask。
+- `cell_master_base` 是去除末尾 `X<drive>` 的字面归并；没有匹配 Liberty 时，它不是功能 family、pin role 或 arc legal mask 的替代品。
+- `G_delay_input` 不含 Delay、output slew、AT、slack、setup 或 power。每个样本目前缺少 Liberty/PVT/SDC/activity/physical 条件，状态固定为 `condition_incomplete_external`，所以只用于输入充分性与后续条件补全，不直接进入这些任务的训练。
+
 ## 0. 输入与约定
 
 - `X`：节点特征，形状 `[B, V, d_x]`。
@@ -233,7 +242,7 @@ CUDA、排列等变性、训练和 test 对照。
 2. 完整 timing graph 的 path-level arrival、required、slack、slew 和 criticality；
 3. 多个综合 candidate 的 area/timing delta、QoR ranking 和 Pareto 选择；
 4. Yosys equivalence/formal 驱动的电路功能和结构表示任务。
-标签协议分为 synthesis-level 与 physical-level。前者使用 Yosys/ABC 和 OpenSTA；后者增加 OpenROAD floorplan/placement/CTS/routing、OpenRCX SPEF 和 post-route OpenSTA。power 必须登记 activity、corner、frequency 和 Liberty 条件；没有这些字段的结果不称为完整 PPA。
+标签协议分为 synthesis-level 与 physical-level。前者使用 Yosys/ABC 和 OpenSTA；后者增加 OpenROAD floorplan/placement/CTS/routing、OpenRCX SPEF 和 post-route OpenSTA。当前本地 power 数据集只预测同一 Liberty/PVT 下的静态 `cell_leakage_power`，不需要 activity 或 frequency，并把它作为节点局部控制任务；internal/switching/total 动态功耗必须登记 activity、corner、frequency 和 Liberty 条件，否则不称为完整 PPA。
 
 
 ================================================================================
