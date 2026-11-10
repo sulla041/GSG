@@ -1,0 +1,12 @@
+DAC 2027 Grand Master Benchmark: Nine Core Physical & Logical Circuit Tasks,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,
+Circuit Metric Prediction Tasks (Ordered by Hierarchy & Difficulty),,,,MLP,,,,GCN,,,,GAT,,,,Graph Transformer,,,,GPS-R,,,,PreRoutGNN / SOTA,,,,Our Framework (Ours),,,
+Task ID,Task Category,Benchmark Task Name,Target Metric & Unit,r ↑,R² ↑,MAE ↓,MAPE ↓,r ↑,R² ↑,MAE ↓,MAPE ↓,r ↑,R² ↑,MAE ↓,MAPE ↓,r ↑,R² ↑,MAE ↓,MAPE ↓,r ↑,R² ↑,MAE ↓,MAPE ↓,r ↑,R² ↑,MAE ↓,MAPE ↓,r ↑,R² ↑,MAE ↓,MAPE ↓
+Task 1,Local Static (0-Hop),Local Cell Area (A1),Gate Physical Area (μm²),,,,,,,,,,,,,,,,,,,,,,,,,0.9994,0.9983,0.0108,0.0012
+Task 2,Boolean Logic (Multi-Hop),Boolean Signal Prob (DeepGate),"Logical 1 Prob P(1) ∈ [0, 1]",,,,,,,,,,,,,,,,,,,,,,,,,0.9966,0.993,0.0103,0.0214
+Task 3,Boolean Logic (Multi-Hop),Boolean Toggle Prob (DeepGate),"Toggle Prob P(toggle) ∈ [0, 1]",,,,,,,,,,,,,,,,,,,,,,,,,0.9958,0.9915,0.0112,0.0235
+Task 4,Causal Timing (Deep Multi-Hop),Pre-layout Timing (D1),Pin Arrival Time (ps),,,,,,,,,,,,,,,,,,,,,,,,,0.9541,0.881,34.9,0.1048
+Task 5,Causal Timing (Parasitic RC),Post-route RC Timing (D2),Arrival Time with Wire RC (ps),,,,,,,,,,,,,,,,,,,,,,,,,0.9514,0.8681,27.3,0.1043
+Task 6,Micro Transient Physics,Cell Arc Delay (D3),Std-Cell Arc Delay (ps),,,,,,,,,,,,,,,,,,,,,,,,,0.963,0.9207,4.11,0.12
+Task 7,Spatial Layout Geometry,Pre-layout Wirelength (HPWL),Net Half-Perimeter Wirelength (μm),,,,,,,,,,,,,,,,,,,,,,,,,0.8959,0.7204,4.17,0.4712
+Task 8,Macro PPA (Hierarchical Meter),Global Chip Area (P2),Total Cell Physical Area (μm²),,,,,,,,,,,,,,,,,,,,,,,,,0.9754,0.9497,95.94,0.0775
+Task 9,Macro PPA (Hierarchical Meter),Global Leakage Power (P2),Total Static Leakage Power (μW),,,,,,,,,,,,,,,,,,,,,,,,,0.9282,0.84,0.42,0.0958
